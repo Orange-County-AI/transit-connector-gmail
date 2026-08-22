@@ -25,40 +25,149 @@ function pollMilliseconds(config: Record<string, string>): number {
   const seconds = Number.parseInt(config.poll_seconds || "60", 10);
   return Math.max(30, Number.isFinite(seconds) ? seconds : 60) * 1_000;
 }
+type ServiceAccountKey = { client_email?: unknown; private_key?: unknown };
+const GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
+const GMAIL_SCOPE = "https://mail.google.com/";
 
-async function accessToken(ctx: ConnectorCtx): Promise<string> {
-  const cached = await ctx.storage.get<TokenCache>("token");
-  if (cached && cached.expiresAt > Date.now() + 60_000) return cached.accessToken;
-  const clientID = ctx.config.client_id;
-  const clientSecret = ctx.config.client_secret;
-  const refreshToken = ctx.config.refresh_token;
-  if (!clientID || !clientSecret || !refreshToken) {
-    throw new Error("Gmail OAuth credentials are not configured");
+function tokenCacheKey(email: string): string {
+  return `token:${email}`;
+}
+
+function base64UrlBytes(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
+}
+
+function base64ToBytes(value: string): Uint8Array {
+  const binary = atob(value.replaceAll(/\s/g, ""));
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function parseServiceAccountKey(value: string): { clientEmail: string; privateKey: string } {
+  let parsed: ServiceAccountKey;
+  try {
+    parsed = JSON.parse(value) as ServiceAccountKey;
+  } catch {
+    throw new Error("Gmail service-account key is invalid: not valid JSON");
   }
-  const response = await ctx.fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_id: clientID,
-      client_secret: clientSecret,
-      refresh_token: refreshToken,
-      grant_type: "refresh_token",
-    }),
-  });
+  if (typeof parsed.client_email !== "string" || !parsed.client_email) {
+    throw new Error("Gmail service-account key is invalid: missing client_email");
+  }
+  if (typeof parsed.private_key !== "string" || !parsed.private_key) {
+    throw new Error("Gmail service-account key is invalid: missing private_key");
+  }
+  return { clientEmail: parsed.client_email, privateKey: parsed.private_key };
+}
+
+async function serviceAccountAssertion(saKey: string, email: string): Promise<string> {
+  const { clientEmail, privateKey } = parseServiceAccountKey(saKey);
+  const keyData = privateKey
+    .replace("-----BEGIN PRIVATE KEY-----", "")
+    .replace("-----END PRIVATE KEY-----", "")
+    .replaceAll(/\s/g, "");
+  if (!keyData) throw new Error("Gmail service-account key is invalid: empty private_key");
+
+  let key: CryptoKey;
+  try {
+    key = await crypto.subtle.importKey(
+      "pkcs8",
+      base64ToBytes(keyData),
+      { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+  } catch {
+    throw new Error("Gmail service-account key is invalid: private_key is not PKCS#8 RSA");
+  }
+
+  const now = Math.floor(Date.now() / 1_000);
+  const unsigned = [
+    base64Url(JSON.stringify({ alg: "RS256", typ: "JWT" })),
+    base64Url(
+      JSON.stringify({
+        iss: clientEmail,
+        sub: email,
+        aud: GOOGLE_TOKEN_ENDPOINT,
+        scope: GMAIL_SCOPE,
+        iat: now,
+        exp: now + 3_600,
+      }),
+    ),
+  ].join(".");
+  const signature = await crypto.subtle.sign(
+    { name: "RSASSA-PKCS1-v1_5" },
+    key,
+    new TextEncoder().encode(unsigned),
+  );
+  return `${unsigned}.${base64UrlBytes(new Uint8Array(signature))}`;
+}
+
+async function readTokenResponse(response: Response, operation: string): Promise<{
+  accessToken: string;
+  expiresIn: number;
+}> {
   const body = (await response.json()) as {
     access_token?: string;
     expires_in?: number;
     error_description?: string;
   };
   if (!response.ok || !body.access_token) {
-    throw new Error(body.error_description || `Gmail token refresh failed (${response.status})`);
+    throw new Error(body.error_description || `${operation} (${response.status})`);
   }
-  const lifetime = Math.min(body.expires_in ?? 3_600, 3_300) * 1_000;
-  await ctx.storage.put("token", {
-    accessToken: body.access_token,
+  return { accessToken: body.access_token, expiresIn: body.expires_in ?? 3_600 };
+}
+
+async function accessToken(ctx: ConnectorCtx): Promise<string> {
+  const email = ctx.config.email;
+  if (!email) throw new Error("Gmail email is not configured");
+  const cacheKey = tokenCacheKey(email);
+  const cached = await ctx.storage.get<TokenCache>(cacheKey);
+  if (cached && cached.expiresAt > Date.now() + 60_000) return cached.accessToken;
+
+  const saKey = ctx.config.sa_key;
+  let token: { accessToken: string; expiresIn: number };
+  if (saKey) {
+    const assertion = await serviceAccountAssertion(saKey, email);
+    token = await readTokenResponse(
+      await ctx.fetch(GOOGLE_TOKEN_ENDPOINT, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+          assertion,
+        }),
+      }),
+      "Gmail service-account token exchange failed",
+    );
+  } else {
+    const clientID = ctx.config.client_id;
+    const clientSecret = ctx.config.client_secret;
+    const refreshToken = ctx.config.refresh_token;
+    if (!clientID || !clientSecret || !refreshToken) {
+      throw new Error("Gmail OAuth credentials are not configured");
+    }
+    token = await readTokenResponse(
+      await ctx.fetch(GOOGLE_TOKEN_ENDPOINT, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          client_id: clientID,
+          client_secret: clientSecret,
+          refresh_token: refreshToken,
+          grant_type: "refresh_token",
+        }),
+      }),
+      "Gmail token refresh failed",
+    );
+  }
+
+  const lifetime = Math.min(token.expiresIn, 3_300) * 1_000;
+  await ctx.storage.put(cacheKey, {
+    accessToken: token.accessToken,
     expiresAt: Date.now() + lifetime,
   } satisfies TokenCache);
-  return body.access_token;
+  return token.accessToken;
 }
 
 async function gmailFetch(
@@ -256,9 +365,10 @@ const gmail = {
   mode: "poll",
   configFields: [
     { key: "email", label: "Email", required: true },
-    { key: "client_id", label: "OAuth client ID", required: true },
-    { key: "client_secret", label: "OAuth client secret", secret: true, required: true },
-    { key: "refresh_token", label: "OAuth refresh token", secret: true, required: true },
+    { key: "sa_key", label: "Service-account JSON key", secret: true },
+    { key: "client_id", label: "OAuth client ID" },
+    { key: "client_secret", label: "OAuth client secret", secret: true },
+    { key: "refresh_token", label: "OAuth refresh token", secret: true },
     { key: "labels_require", label: "Required labels" },
     { key: "labels_exclude", label: "Excluded labels" },
     { key: "poll_seconds", label: "Poll seconds", placeholder: "60" },
