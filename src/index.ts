@@ -389,9 +389,15 @@ async function normalizeMessage(
 
 async function profileHistoryID(ctx: ConnectorCtx): Promise<string> {
   const response = await gmailFetch(ctx, "/profile");
-  const profile = (await response.json()) as { historyId?: string };
+  const profile = (await response.json()) as {
+    historyId?: string;
+    error?: { message?: string; status?: string };
+  };
   if (!response.ok || !profile.historyId) {
-    throw new Error(`Gmail profile failed (${response.status})`);
+    const detail = profile.error?.message || profile.error?.status;
+    throw new Error(
+      `Gmail profile failed (${response.status})${detail ? `: ${detail}` : ""}`,
+    );
   }
   return profile.historyId;
 }
