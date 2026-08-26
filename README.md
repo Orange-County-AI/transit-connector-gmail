@@ -14,6 +14,8 @@ Build-time Gmail History API adapter for Transit. Polls from a durable `historyI
 
 Create a Google OAuth client, complete one local consent flow with offline access, and store the refresh token in the Transit integration form. The first successful start records the current profile `historyId` without replaying old mail. A 404 history expiry resets that watermark and records the possible gap.
 
+Filename, MIME type, size, and MIME-part identity are stored with each event. Attachment bytes stay in Gmail until the assigned agent calls `read_message`; Transit fetches them with the integration's OAuth credential and materializes local files without exposing that credential.
+
 ```bash
 bun install
 bun run typecheck

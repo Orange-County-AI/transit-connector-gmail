@@ -1,6 +1,7 @@
 import {
   CONNECTOR_API,
   type Connector,
+  type ConnectorAttachment,
   type ConnectorCtx,
   type ConnectorEvent,
   type ReplyRequest,
@@ -10,7 +11,12 @@ type TokenCache = { accessToken: string; expiresAt: number };
 type GmailHeader = { name?: string; value?: string };
 type GmailPart = {
   mimeType?: string;
-  body?: { data?: string };
+  filename?: string;
+  body?: {
+    data?: string;
+    attachmentId?: string;
+    size?: number;
+  };
   parts?: GmailPart[];
 };
 type GmailMessage = {
@@ -206,6 +212,51 @@ function decodeBase64Url(value: string): string {
   );
 }
 
+function attachmentParts(
+  part: GmailPart | undefined,
+  path = "root",
+): ConnectorAttachment[] {
+  if (!part) return [];
+  const own =
+    part.filename && (part.body?.attachmentId || part.body?.data)
+      ? [{
+          id: path,
+          name: part.filename,
+          ...(part.mimeType ? { contentType: part.mimeType } : {}),
+          ...(part.body?.size !== undefined ? { size: part.body.size } : {}),
+        }]
+      : [];
+  return [
+    ...own,
+    ...(part.parts ?? []).flatMap((child, index) =>
+      attachmentParts(child, path === "root" ? String(index) : `${path}.${index}`),
+    ),
+  ];
+}
+
+function partAtPath(
+  part: GmailPart | undefined,
+  path: string,
+): GmailPart | undefined {
+  if (!part) return undefined;
+  if (path === "root") return part;
+  let current: GmailPart | undefined = part;
+  for (const raw of path.split(".")) {
+    if (!/^(0|[1-9]\d*)$/u.test(raw)) return undefined;
+    current = current.parts?.[Number(raw)];
+    if (!current) return undefined;
+  }
+  return current;
+}
+
+function decodeBase64UrlBytes(value: string): Uint8Array {
+  const padded = value
+    .replaceAll("-", "+")
+    .replaceAll("_", "/")
+    .padEnd(Math.ceil(value.length / 4) * 4, "=");
+  return Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
+}
+
 function textBody(part: GmailPart | undefined): string {
   if (!part) return "";
   if (part.mimeType === "text/plain" && part.body?.data) {
@@ -245,7 +296,13 @@ async function normalizeMessage(
   if (!labelsAllowed(message, ctx.config)) return null;
   const from = header(message, "From") || "unknown";
   const subject = header(message, "Subject") || "(no subject)";
-  const body = textBody(message.payload).trim() || message.snippet || "(empty email)";
+  const attachments = attachmentParts(message.payload).slice(0, 16);
+  const text = textBody(message.payload).trim() || message.snippet || "(empty email)";
+  const body = `${text}${
+    attachments.length > 0
+      ? `\n\n[Gmail attachments: ${attachments.length}]`
+      : ""
+  }`;
   const fromEmail = from.match(/<([^>]+)>/u)?.[1] ?? from;
   return {
     eventKey: `${ctx.config.email}:${message.id}`,
@@ -253,6 +310,7 @@ async function normalizeMessage(
     user: from,
     trigger: "email",
     content: `New email from ${from}\nSubject: ${subject}\n\n${body}`,
+    ...(attachments.length > 0 ? { attachments } : {}),
     meta: {
       gmail_id: message.id,
       thread_id: message.threadId,
@@ -332,6 +390,46 @@ function base64Url(value: string): string {
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
 }
 
+async function fetchAttachment(
+  ctx: ConnectorCtx,
+  event: ConnectorEvent,
+  attachment: ConnectorAttachment,
+): Promise<Response> {
+  const messageID = event.meta?.gmail_id;
+  if (!messageID) throw new Error("Gmail event has no message id");
+  const message = await fetchMessage(ctx, messageID);
+  const part = partAtPath(message.payload, attachment.id);
+  if (!part || part.filename !== attachment.name) {
+    throw new Error(`Gmail attachment ${attachment.id} is no longer present`);
+  }
+
+  let bytes: Uint8Array;
+  if (part.body?.data) {
+    bytes = decodeBase64UrlBytes(part.body.data);
+  } else if (part.body?.attachmentId) {
+    const response = await gmailFetch(
+      ctx,
+      `/messages/${encodeURIComponent(messageID)}/attachments/${encodeURIComponent(
+        part.body.attachmentId,
+      )}`,
+    );
+    const body = (await response.json()) as { data?: string };
+    if (!response.ok || !body.data) {
+      throw new Error(`Gmail attachment get failed (${response.status})`);
+    }
+    bytes = decodeBase64UrlBytes(body.data);
+  } else {
+    throw new Error(`Gmail attachment ${attachment.id} has no data`);
+  }
+
+  return new Response(bytes, {
+    headers: {
+      "content-type": part.mimeType || "application/octet-stream",
+      "content-length": String(bytes.byteLength),
+    },
+  });
+}
+
 async function postReply(ctx: ConnectorCtx, request: ReplyRequest): Promise<void> {
   const to = request.event.meta?.from_email;
   if (!to) throw new Error("Gmail event has no reply address");
@@ -376,6 +474,7 @@ const gmail = {
   ],
   start: wake,
   wake,
+  fetchAttachment,
   postReply,
 } satisfies Connector;
 

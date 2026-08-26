@@ -117,6 +117,72 @@ describe("Gmail connector", () => {
     });
   });
 
+  it("declares nested files and streams Gmail attachment bytes", async () => {
+    const message = {
+      id: "gmail-file",
+      threadId: "thread-file",
+      labelIds: ["INBOX"],
+      payload: {
+        mimeType: "multipart/mixed",
+        headers: [
+          { name: "From", value: "Ada <ada@example.com>" },
+          { name: "Subject", value: "The brief" },
+        ],
+        parts: [
+          {
+            mimeType: "text/plain",
+            body: { data: "cGxlYXNlIHJldmlldw" },
+          },
+          {
+            mimeType: "application/pdf",
+            filename: "brief.pdf",
+            body: { attachmentId: "attachment-1", size: 3 },
+          },
+        ],
+      },
+    };
+    const connectorFetch = (async (input: RequestInfo | URL) => {
+      const url = new URL(input.toString());
+      if (url.origin === "https://oauth2.googleapis.com") {
+        return Response.json({ access_token: "access", expires_in: 3_600 });
+      }
+      if (url.pathname.endsWith("/messages/gmail-file")) {
+        return Response.json(message);
+      }
+      if (url.pathname.endsWith("/attachments/attachment-1")) {
+        return Response.json({ data: "AQID", size: 3 });
+      }
+      throw new Error(`unexpected Gmail call: ${url}`);
+    }) as typeof fetch;
+    const ctx = context(
+      {
+        email: "agent@example.com",
+        client_id: "client",
+        client_secret: "secret",
+        refresh_token: "refresh",
+      },
+      connectorFetch,
+    );
+    const event = await normalizeGmailMessage(ctx, message);
+    expect(event?.attachments).toEqual([
+      {
+        id: "1",
+        name: "brief.pdf",
+        contentType: "application/pdf",
+        size: 3,
+      },
+    ]);
+    expect(event?.content).toContain("[Gmail attachments: 1]");
+
+    const response = await gmail.fetchAttachment!(
+      ctx,
+      event!,
+      event!.attachments![0]!,
+    );
+    expect(response.headers.get("content-type")).toBe("application/pdf");
+    expect([...new Uint8Array(await response.arrayBuffer())]).toEqual([1, 2, 3]);
+  });
+
   it("filters required and excluded labels", async () => {
     const event = await normalizeGmailMessage(
       context({
