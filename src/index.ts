@@ -35,8 +35,13 @@ type ServiceAccountKey = { client_email?: unknown; private_key?: unknown };
 const GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 const GMAIL_SCOPE = "https://mail.google.com/";
 
-function tokenCacheKey(email: string): string {
-  return `token:${email}`;
+function tokenCacheKey(config: Record<string, string>, email: string): string {
+  const authority = config.sa_key
+    ? "service-account"
+    : config.dwd_service_account
+      ? `keyless:${config.dwd_service_account}`
+      : "oauth";
+  return `token:${email}:${authority}`;
 }
 
 function base64UrlBytes(bytes: Uint8Array): string {
@@ -203,7 +208,7 @@ async function keylessServiceAccountToken(
 async function accessToken(ctx: ConnectorCtx): Promise<string> {
   const email = ctx.config.email;
   if (!email) throw new Error("Gmail email is not configured");
-  const cacheKey = tokenCacheKey(email);
+  const cacheKey = tokenCacheKey(ctx.config, email);
   const cached = await ctx.storage.get<TokenCache>(cacheKey);
   if (cached && cached.expiresAt > Date.now() + 60_000) return cached.accessToken;
 

@@ -304,19 +304,22 @@ describe("Gmail connector", () => {
       throw new Error(`unexpected fetch: ${request.url}`);
     };
 
-    await gmail.start(
-      context(
-        {
-          email: "stub@theticket500.com",
-          client_id: "caller-client",
-          client_secret: "caller-secret",
-          refresh_token: "caller-refresh",
-          dwd_service_account:
-            "workspace-admin@ticket-500-501723.iam.gserviceaccount.com",
-        },
-        connectorFetch,
-      ),
+    const ctx = context(
+      {
+        email: "stub@theticket500.com",
+        client_id: "caller-client",
+        client_secret: "caller-secret",
+        refresh_token: "caller-refresh",
+        dwd_service_account:
+          "workspace-admin@ticket-500-501723.iam.gserviceaccount.com",
+      },
+      connectorFetch,
     );
+    await ctx.storage.put("token:stub@theticket500.com:oauth", {
+      accessToken: "stale-caller-token",
+      expiresAt: Date.now() + 3_600_000,
+    });
+    await gmail.start(ctx);
 
     expect(forms).toHaveLength(2);
     expect(signedPayload).toMatchObject({
