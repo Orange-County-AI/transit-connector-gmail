@@ -124,6 +124,82 @@ async function readTokenResponse(response: Response, operation: string): Promise
   return { accessToken: body.access_token, expiresIn: body.expires_in ?? 3_600 };
 }
 
+async function refreshCallerToken(ctx: ConnectorCtx): Promise<{
+  accessToken: string;
+  expiresIn: number;
+}> {
+  const clientID = ctx.config.client_id;
+  const clientSecret = ctx.config.client_secret;
+  const refreshToken = ctx.config.refresh_token;
+  if (!clientID || !clientSecret || !refreshToken) {
+    throw new Error("Gmail OAuth credentials are not configured");
+  }
+  return readTokenResponse(
+    await ctx.fetch(GOOGLE_TOKEN_ENDPOINT, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: clientID,
+        client_secret: clientSecret,
+        refresh_token: refreshToken,
+        grant_type: "refresh_token",
+      }),
+    }),
+    "Gmail token refresh failed",
+  );
+}
+
+async function keylessServiceAccountToken(
+  ctx: ConnectorCtx,
+  callerToken: string,
+  serviceAccount: string,
+  email: string,
+): Promise<{ accessToken: string; expiresIn: number }> {
+  const now = Math.floor(Date.now() / 1_000);
+  const payload = JSON.stringify({
+    iss: serviceAccount,
+    sub: email,
+    aud: GOOGLE_TOKEN_ENDPOINT,
+    scope: GMAIL_SCOPE,
+    iat: now,
+    exp: now + 3_600,
+  });
+  const signed = await ctx.fetch(
+    `https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${encodeURIComponent(
+      serviceAccount,
+    )}:signJwt`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${callerToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ payload }),
+    },
+  );
+  const signedBody = (await signed.json()) as {
+    signedJwt?: string;
+    error?: { message?: string };
+  };
+  if (!signed.ok || !signedBody.signedJwt) {
+    throw new Error(
+      signedBody.error?.message ||
+        `Gmail IAM signJwt failed (${signed.status})`,
+    );
+  }
+  return readTokenResponse(
+    await ctx.fetch(GOOGLE_TOKEN_ENDPOINT, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        assertion: signedBody.signedJwt,
+      }),
+    }),
+    "Gmail keyless service-account token exchange failed",
+  );
+}
+
 async function accessToken(ctx: ConnectorCtx): Promise<string> {
   const email = ctx.config.email;
   if (!email) throw new Error("Gmail email is not configured");
@@ -147,25 +223,15 @@ async function accessToken(ctx: ConnectorCtx): Promise<string> {
       "Gmail service-account token exchange failed",
     );
   } else {
-    const clientID = ctx.config.client_id;
-    const clientSecret = ctx.config.client_secret;
-    const refreshToken = ctx.config.refresh_token;
-    if (!clientID || !clientSecret || !refreshToken) {
-      throw new Error("Gmail OAuth credentials are not configured");
+    token = await refreshCallerToken(ctx);
+    if (ctx.config.dwd_service_account) {
+      token = await keylessServiceAccountToken(
+        ctx,
+        token.accessToken,
+        ctx.config.dwd_service_account,
+        email,
+      );
     }
-    token = await readTokenResponse(
-      await ctx.fetch(GOOGLE_TOKEN_ENDPOINT, {
-        method: "POST",
-        headers: { "content-type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          client_id: clientID,
-          client_secret: clientSecret,
-          refresh_token: refreshToken,
-          grant_type: "refresh_token",
-        }),
-      }),
-      "Gmail token refresh failed",
-    );
   }
 
   const lifetime = Math.min(token.expiresIn, 3_300) * 1_000;
@@ -467,6 +533,12 @@ const gmail = {
     { key: "client_id", label: "OAuth client ID" },
     { key: "client_secret", label: "OAuth client secret", secret: true },
     { key: "refresh_token", label: "OAuth refresh token", secret: true },
+    {
+      key: "dwd_service_account",
+      label: "Keyless DWD service-account email",
+      help:
+        "Optional. Uses the OAuth refresh token only to call IAM signJwt, then exchanges a domain-wide delegated assertion as the mailbox user.",
+    },
     { key: "labels_require", label: "Required labels" },
     { key: "labels_exclude", label: "Excluded labels" },
     { key: "poll_seconds", label: "Poll seconds", placeholder: "60" },

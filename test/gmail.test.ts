@@ -273,6 +273,60 @@ describe("Gmail connector", () => {
     ).rejects.toThrow("Gmail service-account key is invalid: not valid JSON");
   });
 
+  it("uses refresh credentials only to sign a keyless DWD assertion", async () => {
+    const forms: URLSearchParams[] = [];
+    let signedPayload: Record<string, unknown> | undefined;
+    const connectorFetch: typeof fetch = async (input, init) => {
+      const request = new Request(input, init);
+      const url = new URL(request.url);
+      if (url.hostname === "oauth2.googleapis.com") {
+        const form = new URLSearchParams(await request.text());
+        forms.push(form);
+        if (form.get("grant_type") === "refresh_token") {
+          return Response.json({ access_token: "caller-token", expires_in: 3_600 });
+        }
+        expect(form.get("assertion")).toBe("signed-jwt");
+        return Response.json({ access_token: "delegated-token", expires_in: 3_600 });
+      }
+      if (url.hostname === "iamcredentials.googleapis.com") {
+        expect(request.headers.get("authorization")).toBe("Bearer caller-token");
+        expect(url.pathname).toContain(
+          "workspace-admin%40ticket-500-501723.iam.gserviceaccount.com",
+        );
+        const body = (await request.json()) as { payload: string };
+        signedPayload = JSON.parse(body.payload) as Record<string, unknown>;
+        return Response.json({ signedJwt: "signed-jwt" });
+      }
+      if (url.hostname === "gmail.googleapis.com") {
+        expect(request.headers.get("authorization")).toBe("Bearer delegated-token");
+        return Response.json({ historyId: "history-1" });
+      }
+      throw new Error(`unexpected fetch: ${request.url}`);
+    };
+
+    await gmail.start(
+      context(
+        {
+          email: "stub@theticket500.com",
+          client_id: "caller-client",
+          client_secret: "caller-secret",
+          refresh_token: "caller-refresh",
+          dwd_service_account:
+            "workspace-admin@ticket-500-501723.iam.gserviceaccount.com",
+        },
+        connectorFetch,
+      ),
+    );
+
+    expect(forms).toHaveLength(2);
+    expect(signedPayload).toMatchObject({
+      iss: "workspace-admin@ticket-500-501723.iam.gserviceaccount.com",
+      sub: "stub@theticket500.com",
+      aud: "https://oauth2.googleapis.com/token",
+      scope: "https://mail.google.com/",
+    });
+  });
+
   it("continues to exchange a configured refresh token", async () => {
     let tokenRequest: URLSearchParams | undefined;
     const connectorFetch: typeof fetch = async (input, init) => {
