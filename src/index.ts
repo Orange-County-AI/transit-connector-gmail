@@ -354,10 +354,37 @@ function labelsAllowed(message: GmailMessage, config: Record<string, string>): b
   return required.every((label) => labels.has(label)) && !excluded.some((label) => labels.has(label));
 }
 
-async function fetchMessage(ctx: ConnectorCtx, id: string): Promise<GmailMessage> {
+/**
+ * A message named by `history.list` can be absent by the time it is fetched,
+ * PERMANENTLY, when it was hard-deleted rather than trashed — Gmail answers 404
+ * then and will answer 404 forever. Returning null instead of throwing is what
+ * lets `wake()` reach its `history_id` commit: the watermark is written only
+ * after the whole page is walked, so a throw here pins it and every later poll
+ * re-reads the same page, re-fetches the same dead id and throws again. That is
+ * not a stall, it is a poison pill: one deleted message blocks the mailbox
+ * indefinitely. Measured on ws-ticket500 2026-08-29 — `1a049e82829e5a37` went
+ * 404 at 19:44:40Z, the connector reported `Gmail message get failed (404)`
+ * continuously, and four later messages (two of them from a customer) never
+ * became events across 5h45m with no self-heal available.
+ *
+ * ONLY 404 is tolerated. Every other status still throws, because an auth,
+ * quota or 5xx failure must NOT advance the watermark — skipping those would
+ * turn a retryable outage into silently dropped mail, which is the worse bug.
+ */
+async function fetchMessageIfPresent(
+  ctx: ConnectorCtx,
+  id: string,
+): Promise<GmailMessage | null> {
   const response = await gmailFetch(ctx, `/messages/${encodeURIComponent(id)}?format=full`);
+  if (response.status === 404) return null;
   if (!response.ok) throw new Error(`Gmail message get failed (${response.status})`);
   return response.json<GmailMessage>();
+}
+
+async function fetchMessage(ctx: ConnectorCtx, id: string): Promise<GmailMessage> {
+  const message = await fetchMessageIfPresent(ctx, id);
+  if (!message) throw new Error("Gmail message get failed (404)");
+  return message;
 }
 
 async function normalizeMessage(
@@ -442,10 +469,15 @@ async function wake(ctx: ConnectorCtx): Promise<void> {
       for (const history of body.history ?? []) {
         for (const added of history.messagesAdded ?? []) {
           if (!added.message?.id) continue;
-          const event = await normalizeMessage(
-            ctx,
-            await fetchMessage(ctx, added.message.id),
-          );
+          const message = await fetchMessageIfPresent(ctx, added.message.id);
+          if (!message) {
+            ctx.log(
+              "warn",
+              `Gmail message ${added.message.id} no longer exists (404); skipped so the watermark can advance`,
+            );
+            continue;
+          }
+          const event = await normalizeMessage(ctx, message);
           if (event) await ctx.ingest(event);
         }
         if (history.id) latest = history.id;

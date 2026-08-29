@@ -366,4 +366,64 @@ describe("Gmail connector", () => {
       grant_type: "refresh_token",
     });
   });
+
+  it("skips a hard-deleted message and still advances the watermark", async () => {
+    // The regression this exists for: a 404 on ONE message used to throw out of
+    // the history loop before `history_id` was committed, so every later poll
+    // re-read the same page, re-fetched the same dead id and threw again. The
+    // assertion that matters is the watermark MOVING -- without it the mailbox
+    // is blocked forever, which is what happened to ws-ticket500 for 5h45m.
+    const ingested: string[] = [];
+    const connectorFetch: typeof fetch = async (input, init) => {
+      const request = new Request(input, init);
+      const url = new URL(request.url);
+      if (url.hostname === "oauth2.googleapis.com") {
+        return Response.json({ access_token: "token", expires_in: 3_600 });
+      }
+      if (url.pathname.endsWith("/history")) {
+        return Response.json({
+          history: [
+            {
+              id: "20500",
+              messagesAdded: [
+                { message: { id: "dead-message" } },
+                { message: { id: "live-message" } },
+              ],
+            },
+          ],
+          historyId: "20530",
+        });
+      }
+      if (url.pathname.endsWith("/messages/dead-message")) {
+        return Response.json({ error: { message: "Not Found" } }, { status: 404 });
+      }
+      if (url.pathname.endsWith("/messages/live-message")) {
+        return Response.json({
+          id: "live-message",
+          threadId: "live-thread",
+          labelIds: ["INBOX"],
+          snippet: "still here",
+          payload: { headers: [{ name: "From", value: "stacey@theticket500.com" }] },
+        });
+      }
+      throw new Error(`unexpected fetch: ${request.url}`);
+    };
+
+    const ctx = context(
+      { email: "stub@theticket500.com", refresh_token: "r", client_id: "c", client_secret: "s" },
+      connectorFetch,
+    );
+    ctx.ingest = async (event) => {
+      ingested.push(String(event.meta?.gmail_id));
+      return { status: "queued" };
+    };
+    await ctx.storage.put("history_id", "20419");
+
+    await gmail.wake(ctx);
+
+    // The dead id is skipped, the live one behind it is NOT lost, and the
+    // watermark leaves 20419 -- the three properties the poison pill broke.
+    expect(ingested).toEqual(["live-message"]);
+    expect(await ctx.storage.get("history_id")).toBe("20530");
+  });
 });
